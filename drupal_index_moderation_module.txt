@@ -1,0 +1,319 @@
+/*
+Drupal module focused on content moderation, publishing and indexing moderation state of recent revisions. This module also allows content editors to schedule the publication and unpublishing of content nodes based on a specified date and time.
+*/
+
+<?php
+
+namespace Drupal\MYMODULE\Plugin\search_api\processor;
+
+use Drupal\search_api\Datasource\DatasourceInterface;
+use Drupal\search_api\IndexInterface;
+use Drupal\search_api\Item\ItemInterface;
+use Drupal\search_api\Processor\ProcessorPluginBase;
+use Drupal\search_api\Processor\EntityProcessorProperty;
+use Drupal\search_api\Utility\Utility;
+
+
+/**
+ * Adds the item's latest revision info to the indexed data.
+ *
+ * @SearchApiProcessor(
+ *   id = "latest_revision",
+ *   label = @Translation("Latest revision"),
+ *   description = @Translation("Adds the item's latest revision to the indexed data."),
+ *   stages = {
+ *     "add_properties" = 20,
+ *   },
+ *   locked = true,
+ *   hidden = true,
+ * )
+ */
+class LatestRevision extends ProcessorPluginBase {
+
+  /**
+   * {@inheritdoc}
+   */
+  public static function supportsIndex(IndexInterface $index) {
+    foreach ($index->getDatasources() as $datasource) {
+      if ($datasource->getEntityTypeId() === 'node') {
+        return TRUE;
+      }
+    }
+    return FALSE;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function getPropertyDefinitions(DatasourceInterface $datasource = NULL) {
+    $properties = [];
+    if ($datasource && $datasource->getEntityTypeId() === 'node') {
+      $definition = [
+        'label' => $this->t('Latest revision'),
+        'description' => $this->t('The latest revision of the node.'),
+        'type' => 'entity:node',
+        'processor_id' => $this->getPluginId(),
+      ];
+      $properties['latest_revision'] = new EntityProcessorProperty($definition);
+      $properties['latest_revision']->setEntityTypeId('node');
+    }
+    return $properties;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function addFieldValues(ItemInterface $item) {
+    /** @var \Drupal\Core\Entity\Entity $entity */
+    $entity = $item->getOriginalObject()->getValue();
+
+    /** @var \Drupal\workbench_moderation\ModerationInformationInterface $moderation_info */
+    $moderation_info = \Drupal::service('workbench_moderation.moderation_information');
+    if ($moderation_info->isModeratableEntity($entity)) {
+      if ($latest = $moderation_info->getLatestRevision($entity->getEntityTypeId(), $entity->id())) {
+
+        // Extract latest revision fields.
+        /** @var \Drupal\search_api\Item\FieldInterface[][] $to_extract */
+        $to_extract = [];
+        foreach ($item->getFields() as $field) {
+          if (!$field->getDatasourceId()) {
+            continue;
+          }
+          $property_path = $field->getPropertyPath();
+          list($direct, $nested) = Utility::splitPropertyPath($property_path, FALSE);
+          if ($direct === 'latest_revision') {
+            $to_extract[$nested][] = $field;
+          }
+        }
+
+        if (!$to_extract) {
+          return;
+        }
+
+        $this->getFieldsHelper()
+          ->extractFields($latest->getTypedData(), $to_extract, $item->getLanguage());
+
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook_permission().
+ */
+function content_scheduler_permission() {
+  return array(
+    'schedule content' => array(
+      'title' => t('Schedule content publication and unpublishing'),
+      'description' => t('Allows users to schedule when content should be published and unpublished.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() to add scheduling fields to node forms.
+ */
+function content_scheduler_form_node_form_alter(&$form, &$form_state, $form_id) {
+  $node = $form_state->getFormObject()->getEntity();
+
+  if ($node->getEntityType()->getBundleOf() == 'article') {
+    $form['publishing_schedule'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Publishing Schedule'),
+      '#group' => 'additional_settings',
+      '#attributes' => array('class' => array('content-scheduler')),
+      '#states' => array(
+        'visible' => array(
+          ':input[name="status"]' => array('value' => NODE_NOT_PUBLISHED),
+        ),
+      ),
+    );
+
+    $form['publishing_schedule']['publish_on'] = array(
+      '#type' => 'datetime',
+      '#title' => t('Publish On'),
+      '#default_value' => isset($node->publish_on) ? $node->publish_on : '',
+      '#date_date_format' => 'Y-m-d H:i',
+      '#date_time_format' => 'H:i',
+      '#description' => t('Specify the date and time to publish this content.'),
+    );
+
+    $form['publishing_schedule']['unpublish_on'] = array(
+      '#type' => 'datetime',
+      '#title' => t('Unpublish On'),
+      '#default_value' => isset($node->unpublish_on) ? $node->unpublish_on : '',
+      '#date_date_format' => 'Y-m-d H:i',
+      '#date_time_format' => 'H:i',
+      '#description' => t('Specify the date and time to unpublish this content.'),
+    );
+
+    // Restrict access to scheduling fields based on permissions.
+    if (!user_access('schedule content')) {
+      $form['publishing_schedule']['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_presave() to save scheduling information.
+ */
+function content_scheduler_entity_presave(Drupal\Core\Entity\EntityInterface $entity) {
+  if ($entity->getEntityType()->id() == 'node' && $entity->bundle() == 'article') {
+    $values = $entity->toArray();
+    if (!empty($values['publish_on'])) {
+      $entity->set('status', NODE_NOT_PUBLISHED);
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert() for nodes.
+ */
+function content_moderation_node_insert(EntityInterface $entity) {
+  // Send notification when content is published.
+  if ($entity->getType() == 'article' && $entity->isPublished()) {
+    $authors = $entity->getOwner()->getEmail();
+    $subject = t('New article published: @title', array('@title' => $entity->getTitle()));
+    $message = t('The article "@title" has been published on your site.', array('@title' => $entity->getTitle()));
+    // Example: Send email notification to authors.
+    \Drupal::service('plugin.manager.mail')->mail('system', 'mail', $authors, language_default(), array('message' => $message, 'subject' => $subject));
+  }
+}
+
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\content_moderation\ModerationInformationInterface;
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\StringTranslation\StringTranslationTrait;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+
+/**
+ * Class ContentModerationService.
+ */
+class ContentModerationService {
+
+  use StringTranslationTrait;
+
+  /**
+   * The moderation information service.
+   *
+   * @var \Drupal\content_moderation\ModerationInformationInterface
+   */
+  protected $moderationInformation;
+
+  /**
+   * The entity type manager.
+   *
+   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
+   */
+  protected $entityTypeManager;
+
+  /**
+   * Constructs a ContentModerationService object.
+   *
+   * @param \Drupal\content_moderation\ModerationInformationInterface $moderation_information
+   *   The moderation information service.
+   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
+   *   The entity type manager.
+   */
+  public function __construct(ModerationInformationInterface $moderation_information, EntityTypeManagerInterface $entity_type_manager) {
+    $this->moderationInformation = $moderation_information;
+    $this->entityTypeManager = $entity_type_manager;
+  }
+
+  /**
+   * Transition an entity to a new moderation state.
+   *
+   * @param \Drupal\Core\Entity\EntityInterface $entity
+   *   The entity to transition.
+   * @param string $transition_id
+   *   The ID of the transition to execute.
+   * @param \Drupal\Core\Session\AccountInterface $account
+   *   The user account performing the transition.
+   */
+  public function transitionEntity(EntityInterface $entity, $transition_id, AccountInterface $account) {
+    $moderation_state = $entity->moderation_state->value;
+    $transitions = $this->moderationInformation->getAllTransitions($entity->getEntityTypeId(), $entity->bundle(), $moderation_state);
+    if (isset($transitions[$transition_id])) {
+      $transition = $transitions[$transition_id];
+      if (in_array($moderation_state, $transition['from'])) {
+        $entity->moderation_state->value = $transition['to'];
+        $entity->save();
+
+        // Log the state transition.
+        $this->logStateTransition($entity, $transition_id, $account);
+      }
+    }
+  }
+
+  /**
+   * Log the state transition.
+   *
+   * @param \Drupal\Core\Entity\EntityInterface $entity
+   *   The entity whose state is being transitioned.
+   * @param string $transition_id
+   *   The ID of the transition.
+   * @param \Drupal\Core\Session\AccountInterface $account
+   *   The user account performing the transition.
+   */
+  protected function logStateTransition(EntityInterface $entity, $transition_id, AccountInterface $account) {
+    // Implement your logging logic here, e.g., store in a dedicated logging table.
+    // Example: Logging to watchdog.
+    $this->logger('content_moderation')->notice('@username transitioned @entity_type @entity_id to @transition_id', array(
+      '@username' => $account->getDisplayName(),
+      '@entity_type' => $entity->getEntityTypeId(),
+      '@entity_id' => $entity->id(),
+      '@transition_id' => $transition_id,
+    ));
+  }
+
+  /**
+   * Retrieves the moderation state label.
+   *
+   * @param string $state_id
+   *   The ID of the moderation state.
+   *
+   * @return string
+   *   The label of the moderation state.
+   */
+  public function getModerationStateLabel($state_id) {
+    return $this->moderationInformation->getStateLabel($state_id);
+  }
+
+}
+/**
+ * Implements hook_entity_bundle_info_alter().
+ */
+function content_moderation_entity_bundle_info_alter(array &$bundles) {
+  // Add moderation states to the 'article' content type.
+  if (isset($bundles['node']['article'])) {
+    $bundles['node']['article']['content_moderation_state'] = array(
+      'label' => t('Content Moderation State'),
+      'states' => array(
+        'draft' => t('Draft'),
+        'review' => t('In Review'),
+        'published' => t('Published'),
+        'archived' => t('Archived'),
+      ),
+      'transitions' => array(
+        'to_review' => array(
+          'label' => t('Submit for Review'),
+          'from' => array('draft'),
+          'to' => 'review',
+        ),
+        'publish' => array(
+          'label' => t('Publish'),
+          'from' => array('review'),
+          'to' => 'published',
+        ),
+        'archive' => array(
+          'label' => t('Archive'),
+          'from' => array('published'),
+          'to' => 'archived',
+        ),
+      ),
+    );
+  }
+}
+?>
